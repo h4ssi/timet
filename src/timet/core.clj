@@ -5,11 +5,13 @@
             [clojure.string :as s]))
 
 (defn tracker [d m y & entries]
+  "define a tracker by its start date and time tracking entries"
   {:start (t/local-date y m d)
    :entries entries
-   :minutes-per-day (* 60 (/ 20 5))})
+   :minutes-per-day (* 60 (/ 20 5))}) ; for now fixed to 20h
 
 (defn record
+  "define a record by its type and its duration in hours and minutes and optionally a comment"
   ([type h m]         {:type type :hour h :minute m})
   ([type h m comment] (assoc (record type h m) :comment comment)))
 
@@ -20,13 +22,23 @@
   {:matcher matcher
    :checker checker})
 
+(defn- time-of-date
+  "combine date and hours/minutes data into datetime instance"
+  [d h m] (t/local-date-time (t/year d) (t/month d) (t/day d) h m))
+
 (defn work-day [matcher & come-go-comments]
-  (defn time-of-date [d h m] (t/local-date-time (t/year d) (t/month d) (t/day d) h m))
   (let [come-go  (filter map? come-go-comments)
         comments (filter string? come-go-comments)
-        comment  (when (seq comments) (s/join "; " comments))]
+        comment  (when (seq comments) (s/join "; " comments))
+        type     (cond
+                   (= come-go-comments [:free]) :free
+                   (= come-go-comments [:sick]) :sick
+                   :else :work)]
     {:matcher matcher
-     :checker (fn [_] {:come-go come-go-comments})}))
+     :checker (fn [_] {:type type
+                       :come-go (if (= type :work)
+                                  (vec come-go-comments)
+                                  [(come 8 0) (go 12 0)])})})) ; fixed for 20h
 
 (def mo (partial work-day tpr/monday?))
 (def tu (partial work-day tpr/tuesday?))
@@ -36,42 +48,57 @@
 (def sa (partial work-day tpr/saturday?))
 (def su (partial work-day tpr/sunday?))
 
+(defn enumerate-days
+  "enumerates days from the tracker start"
+  [cal]
+  (iterate #(t/plus % (t/days 1)) (:start cal)))
+
 (defn fill-blanks [cal]
   (defn assoc-date [entry date] (assoc entry :date date))
   (defn empty-entry [date] (assoc-date {} date))
   (let [today (t/today)]
-    (loop [date                 (:start cal)
+    (loop [[d & ds :as days]    (enumerate-days cal)
            [e & es :as entries] (:entries cal)
            new-entries          []]
-      (let [next-date     (t/plus date (t/days 1))]
-        (cond
-         (and
-          (empty? entries)
-          (t/after? date today)) (assoc cal :entries new-entries)
-         (nil? e)                (recur next-date nil (conj new-entries (empty-entry date)))
-         ((:matcher e) date)     (recur next-date es (conj new-entries (assoc-date ((:checker e) date) date)))
-         :else                   (recur next-date entries (conj new-entries (empty-entry date))))))))
+      (cond
+       (and
+        (empty? entries)
+        (t/after? d today))    (assoc cal :entries new-entries)
+       (empty? entries)        (recur ds nil (conj new-entries (empty-entry d)))
+       ((:matcher e) d)        (recur ds es (conj new-entries (assoc-date ((:checker e) d) d)))
+       :else                   (recur ds entries (conj new-entries (empty-entry d)))))))
 
 (comment
   (fill-blanks (tracker 1 6 2014))
   )
 
-(defn time-of-date [d h m] (t/local-date-time (t/year d) (t/month d) (t/day d) h m))
-
-(defn date-time-come-go-of-entry [e] (map #(assoc % :date-time (time-of-date (:date e) (:hour %) (:minute %))) (:come-go e)))
+(defn date-time-come-go-of-entry [e] (map #(assoc % :date-time (time-of-date (:date e) (:hour %) (:minute %)) :entry-type (:type e)) (:come-go e)))
 
 (comment
   (map date-time-come-go-of-entry (:entries (fill-blanks (tracker 10 6 2014 (mo (come 12 0) (go 13 0))))))
   )
 
+(def types [:work :sick :free])
 
-(defn all-records [cal] (mapcat date-time-come-go-of-entry (:entries cal)))
+(defn all-records
+  ([cal] (mapcat date-time-come-go-of-entry (:entries cal)))
+  ([cal type] (filter #(= type (:entry-type %)) (all-records cal))))
 
 (defn check-start-with-come [cal]
-  (when-not (= :come (:type (first (all-records cal)))) (throw (Exception. "Please start your tracker with a come record"))))
+  (doseq [t types]
+    (println t)
+    (let [recs (all-records cal t)]
+    (println recs)
+      (when (and
+             (seq recs)
+             (not= :come (:type (first recs))) (throw (Exception. "Please start your tracker with a come record"))))))) ; todo care for empty
 
 (comment
-  (check-start-with-come (tracker 1 1 2000 (mo (go 12  0))))
+  (mapcat date-time-come-go-of-entry (:entries (fill-blanks (tracker 1 1 2000 (mo (go 12  0))))))
+  (mapcat date-time-come-go-of-entry (:entries (fill-blanks (tracker 1 1 2000 (mo :free)))))
+  (check-start-with-come (fill-blanks (tracker 1 1 2000 (mo (go 12  0)))))
+  (check-start-with-come (fill-blanks (tracker 1 1 2000 (mo :free))))
+  (check-start-with-come (fill-blanks (tracker 1 1 2000 (mo :sick))))
   ((:checker (work-day nil
                      (come  5  0 "bla")
                      (go   14 30)
@@ -83,29 +110,36 @@
 )
 
 (defn check-and-fill-alternating [cal]
-  (assoc cal :entries (loop [[e & es :as entries] (:entries cal)
-                             first-c-iter?        true
-                             [c & cs]             nil
-                             pre-type             :dont-care
-                             new-come-go          []
-                             new-entries          []]
-                        (cond
-                         (nil? e)      new-entries
-                         first-c-iter? (recur entries false (:come-go e) pre-type (if (= pre-type :come) ; prev day ended in come, we then inserted go@24:00
-                                                                                    [(come 0 0)] ; and now insert come@00:00
-                                                                                    []) new-entries)
-                         (nil? c)      (recur es true nil pre-type nil (conj new-entries (assoc e :come-go (if (= pre-type :come) ; last record was come
-                                                                                                             (conj new-come-go (go 24 0)) ; we insert go@24:00, the next day we add come@00:00
-                                                                                                             new-come-go))))
-                         :else         (if (= pre-type (:type c))
-                                              (throw (Exception. (str "consecutive " (name pre-type) " records on " (:date e))))
-                                              (recur entries false cs (:type c) (conj new-come-go c) new-entries))))))
+  (defn add-0  [prev cgs] (if (= prev :come)
+                            (into [(come 0 0)] cgs)
+                            cgs))
+  (defn add-24 [last cgs] (if (= last :come)
+                            (conj cgs (go 24 0))
+                            cgs))
+  (assoc cal
+    :entries (loop [[e & es :as entries] (:entries cal)
+                    prev-type            :dont-care
+                    prev-entry-type      :dont-care
+                    new-entries          []]
+               (if (nil? e)
+                 new-entries
+                 (let [last-type (reduce (fn [prev curr]
+                                           (when (= prev curr) (throw (Exception. (str "consecutive " (name prev) " records on " (:date e)))))
+                                           curr)
+                                         prev-type
+                                         (map :type (:come-go e)))]
+                   (when (and (= prev-type :come) (not= prev-entry-type (:type e))) (throw (Exception. (str "type mismatch between two censecutive days on " (:date e)))))
+                   (recur es
+                          last-type
+                          (:type e)
+                          (conj new-entries
+                                (assoc e :come-go (add-0 prev-type (add-24 last-type (:come-go e)))))))))))
 
 (comment
-  (check-and-fill-alternating (fill-blanks (tracker 10 6 2014 (mo (come 12 0) (go 13 0)))))
-  (check-and-fill-alternating (fill-blanks (tracker 10 6 2014 (mo (come 12 0) (come 13 0)))))
-  (check-and-fill-alternating (fill-blanks (tracker 10 6 2014 (mo (come 12 0)) (tu (go 13 0)))))
-  (check-and-fill-alternating (fill-blanks (tracker 10 6 2014 (mo (come 12 0)) (we (go 13 0)))))
+  ;(check-and-fill-alternating-for-type (fill-blanks (tracker 20 9 2014 (mo (come 12 0) (go 13 0)))) :work)
+  (check-and-fill-alternating (fill-blanks (tracker 20 9 2014 (mo (come 12 0) (go 13 0)))))
+  (check-and-fill-alternating (fill-blanks (tracker 20 9 2014 (mo (come 12 0)) (tu (go 13 0)))))
+  (check-and-fill-alternating (fill-blanks (tracker 20 9 2014 (mo (come 12 0)) (we (go 13 0)))))
   )
 
 (defn check-order [cal]
@@ -120,7 +154,6 @@
   (check-order (fill-blanks (tracker 10 6 2014 (mo (come 12 0) (go 13 0)))))
   (check-order (fill-blanks (tracker 10 6 2014 (mo (come 12 0) (go 11 0)))))
   )
-
 
 (defn -main
   "I don't do a whole lot ... yet."
